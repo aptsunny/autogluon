@@ -13,7 +13,8 @@ def download_shopee(dataset, data_path):
 
 def config_choice(dataset, data_path):
     global kaggle_choice
-    dataset_path = os.path.join(data_path, dataset, 'images')
+    # dataset_path = os.path.join(data_path, dataset, 'images')
+    dataset_path = os.path.join(data_path, 'dog-breed-identification_mini', 'images')
     if dataset == 'dogs-vs-cats-redux-kernels-edition':
         net_cat = ag.space.Categorical('resnet34_v1b', 'resnet34_v1', 'resnet34_v2')
         @ag.obj(
@@ -179,12 +180,7 @@ def config_choice(dataset, data_path):
                          'tricks': tricks,
                          'num_trials': 30}
     elif dataset == 'dog-breed-identification':
-        # net_dog = ag.space.Categorical('resnet101_v1', 'resnet101_v2', 'resnext101_64x4d', 'resnet101_v1b_gn',
-        #                                'resnet101_v1b', 'resnet101_v1c', 'resnet101_v1d',
-        #                                'resnet101_v1s', 'resnext101b_64x4d') # 'resnet101_v1e',
-        net_dog = ag.space.Categorical('resnet101_v1', 'resnext101b_64x4d') # 'resnet101_v1e',
-        # net_dog = ag.space.Categorical('resnext101b_64x4d', 'resnet152_v1')  #
-        #net_dog = ag.space.Categorical('resnext101_64x4d')
+        net_dog = ag.space.Categorical('resnext101_64x4d', 'resnet152_v1')
         @ag.obj(
             # learning_rate=ag.space.Real(0.3, 0.5),
             # momentum=ag.space.Real(0.85, 0.95),
@@ -195,7 +191,7 @@ def config_choice(dataset, data_path):
             # learning_rate=ag.space.Real(1e-4, 1e-3, log=True),
             # momentum=ag.space.Real(0.90, 0.95),
             # wd=ag.space.Real(1e-6, 1e-4, log=True),
-            multi_precision=True  # True fix
+            multi_precision=False  # True fix
         )
         class NAG(optim.NAG):
             pass
@@ -210,7 +206,7 @@ def config_choice(dataset, data_path):
         tricks = ag.space.Dict(
                     last_gamma=True,# final fit inference difference
                     use_pretrained=True,
-                    use_se=False,
+                    use_se=True,
                     mixup=False,
                     mixup_alpha=0.2,
                     mixup_off_epoch=0,

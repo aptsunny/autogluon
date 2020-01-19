@@ -57,7 +57,7 @@ class ImageClassification(BaseTask):
 
     @staticmethod
     def fit(dataset,
-            net=Categorical('ResNet50_v1b', 'ResNet18_v1b'),
+            net=Categorical('mobilenetv2_0.25', 'ResNet18_v1b'),
             optimizer= SGD(learning_rate=Real(1e-3, 1e-2, log=True),
                            wd=Real(1e-4, 1e-3, log=True), multi_precision=False),
             lr_scheduler='cosine',
@@ -279,17 +279,13 @@ class ImageClassification(BaseTask):
                 'grace_period': grace_period if grace_period else epochs//4})
 
         results = BaseTask.run_fit(train_image_classification, search_strategy, scheduler_options)
-
         logger.info(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> finish model fitting")
         args = sample_config(train_image_classification.args, results['best_config'])
         logger.info('The best config: {}'.format(results['best_config']))
-
         kwargs = {'num_classes': results['num_classes'], 'ctx': mx.cpu(0)}
         model = get_network(args.net, **kwargs)
-
         multi_precision = optimizer.kwvars['multi_precision'] if 'multi_precision' in optimizer.kwvars else False
         update_params(model, results.pop('model_params'), multi_precision)
-
 
         if ensemble > 1:
             logger.info(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> ensemble model")
@@ -302,11 +298,10 @@ class ImageClassification(BaseTask):
                 scheduler_options['searcher'] = 'random'
             scheduler = scheduler(train_image_classification, **scheduler_options)
             for i in range(1, ensemble):
-                resultsi = scheduler.run_with_config(results['best_config'])
+                resultsi = scheduler.run_with_config(results['best_config'])#
                 kwargs = {'num_classes': resultsi['num_classes'], 'ctx': mx.cpu(0)}
                 model = get_network(args.net,  **kwargs)
                 update_params(model, resultsi.pop('model_params'), multi_precision)
                 models.append(model)
             model = Ensemble(models)
-
-        return Classifier(model, results, default_val_fn, checkpoint, args)
+        return Classifier(model, results, default_val_fn, checkpoint, args) #result?
