@@ -1,42 +1,42 @@
-import os
-import copy
 import logging
-import mxnet as mx
-from mxnet import gluon, nd
-from ...core.optimizer import *
-from ...core.loss import *
-from ...core import *
-from ...searcher import *
-from ...scheduler import *
-from ...scheduler.resource import get_cpu_count, get_gpu_count
-from ..base import BaseTask
-from ..base.base_task import schedulers
-from ...utils import update_params
+import os
 
+import mxnet as mx
+
+from .classifier import Classifier
 from .dataset import get_dataset
+from .nets import *
 from .pipeline import train_image_classification
 from .utils import *
-from .nets import *
-from .classifier import Classifier
+from ..base import BaseTask
+from ..base.base_task import schedulers
+from ...core import *
+from ...core.loss import *
+from ...core.optimizer import *
+from ...scheduler.resource import get_cpu_count, get_gpu_count
+from ...utils import update_params
 
 __all__ = ['ImageClassification']
 
 logger = logging.getLogger(__name__)
 
+
 class ImageClassification(BaseTask):
     """AutoGluon Task for classifying images based on their content
     """
+    Classifier = Classifier
+
     @staticmethod
     def Dataset(*args, **kwargs):
         """Dataset for AutoGluon image classification tasks. 
            May either be a :class:`autogluon.task.image_classification.ImageFolderDataset`, :class:`autogluon.task.image_classification.RecordDataset`, 
-           or a popular dataset already built into AutoGluon ('mnist', 'cifar10', 'cifar100', 'imagenet').
+           or a popular dataset already built into AutoGluon ('mnist', 'fashionmnist', 'cifar10', 'cifar100', 'imagenet').
 
         Parameters
         ----------
         name : str, optional
             Which built-in dataset to use, will override all other options if specified.
-            The options are: 'mnist', 'cifar', 'cifar10', 'cifar100', 'imagenet'
+            The options are: 'mnist', 'fashionmnist', 'cifar', 'cifar10', 'cifar100', 'imagenet'
         train : bool, default = True
             Whether this dataset should be used for training or validation.
         train_path : str
@@ -58,17 +58,20 @@ class ImageClassification(BaseTask):
     @staticmethod
     def fit(dataset,
             net=Categorical('ResNet50_v1b', 'ResNet18_v1b'),
-            optimizer= SGD(learning_rate=Real(1e-3, 1e-2, log=True),
-                           wd=Real(1e-4, 1e-3, log=True), multi_precision=False),
-            lr_scheduler='cosine',
+            optimizer=NAG(
+                learning_rate=Real(1e-3, 1e-2, log=True),
+                wd=Real(1e-4, 1e-3, log=True),
+                multi_precision=False
+            ),
             loss=SoftmaxCrossEntropyLoss(),
             split_ratio=0.8,
             batch_size=64,
             input_size=224,
             epochs=20,
+            final_fit_epochs=None,
             ensemble=1,
             metric='accuracy',
-            nthreads_per_trial=4,
+            nthreads_per_trial=60,
             ngpus_per_trial=1,
             hybridize=True,
             search_strategy='random',
@@ -82,7 +85,6 @@ class ImageClassification(BaseTask):
             num_trials=2,
             dist_ip_addrs=[],
             grace_period=None,
-
             auto_search=True,
             lr_config=Dict(
                 lr_mode='cosine',
@@ -90,22 +92,24 @@ class ImageClassification(BaseTask):
                 lr_decay_period=0,
                 lr_decay_epoch='40,80',
                 warmup_lr=0.0,
-                warmup_epochs=0),
+                warmup_epochs=0
+            ),
             tricks=Dict(
-                last_gamma=False,#True
-                use_pretrained=False,#True
+                last_gamma=False,
+                use_pretrained=True,
                 use_se=False,
                 mixup=False,
                 mixup_alpha=0.2,
-                mixup_off_epoch= 0,
-                label_smoothing=False,#True
-                no_wd=False,#True
+                mixup_off_epoch=0,
+                label_smoothing=False,
+                no_wd=False,
                 teacher_name=None,
                 temperature=20.0,
                 hard_weight=0.5,
                 batch_norm=False,
                 use_gn=False)
             ):
+        # TODO: ensemble and hybridize are not in docstring
         """
         Fit image classification models to a given dataset.
 
@@ -113,19 +117,19 @@ class ImageClassification(BaseTask):
         ----------
         dataset : str or :meth:`autogluon.task.ImageClassification.Dataset`
             Training dataset containing images and their associated class labels. 
-            Popular image datasets built into AutoGluon can be used by specifying their name as a string (options: ‘mnist’, ‘cifar’, ‘cifar10’, ‘cifar100’, ‘imagenet’).
+            Popular image datasets built into AutoGluon can be used by specifying their name as a string (options: ‘mnist’, ‘fashionmnist’, ‘cifar’, ‘cifar10’, ‘cifar100’, ‘imagenet’).
         input_size : int
             Size of images in the dataset (pixels).
         net : str or :class:`autogluon.space.Categorical`
             Which existing neural network models to consider as candidates.
         optimizer : str or :class:`autogluon.space.AutoGluonObject`
             Which optimizers to consider as candidates for learning the neural network weights.
-        lr_scheduler : str
-            Describes how learning rate should be adjusted over the course of training. Options include: 'cosine', 'poly'.
         batch_size : int
             How many images to group in each mini-batch during gradient computations in training.
         epochs: int
             How many epochs to train the neural networks for at most.
+        final_fit_epochs: int, default None
+            Final fit epochs, the same number of epochs will be used as during the HPO if not specified.
         metric : str or callable object
             Evaluation metric by which predictions will be ulitmately evaluated on test data.
         loss : `mxnet.gluon.loss`
@@ -142,8 +146,6 @@ class ImageClassification(BaseTask):
             How many CPUs to use in each trial (ie. single training run of a model).
         ngpus_per_trial : int
             How many GPUs to use in each trial (ie. single training run of a model). 
-        resources_per_trial : dict
-            Machine resources to allocate per trial.
         output_directory : str
             Dir to save search results.
         search_strategy : str
@@ -183,12 +185,13 @@ class ImageClassification(BaseTask):
         >>> test_data = task.Dataset('~/data/test', train=False)
         >>> test_acc = classifier.evaluate(test_data)
 
+
         Bag of tricks are used on image classification dataset
 
         lr_config
         ----------
         lr-mode : type=str, default='step'.
-            learning rate scheduler mode. options are step, poly and cosine.
+            describes how learning rate should be adjusted over the course of training. Options include: 'cosine', 'poly'.
         lr-decay : type=float, default=0.1.
             decay rate of learning rate. default is 0.1.
         lr-decay-period : type=int, default=0.
@@ -238,11 +241,11 @@ class ImageClassification(BaseTask):
         nthreads_per_trial = get_cpu_count() if nthreads_per_trial > get_cpu_count() else nthreads_per_trial
         ngpus_per_trial = get_gpu_count() if ngpus_per_trial > get_gpu_count() else ngpus_per_trial
 
+        final_fit_epochs = final_fit_epochs if final_fit_epochs else epochs
         train_image_classification.register_args(
             dataset=dataset,
             net=net,
             optimizer=optimizer,
-            lr_scheduler=lr_scheduler,
             loss=loss,
             metric=metric,
             num_gpus=ngpus_per_trial,
@@ -250,13 +253,14 @@ class ImageClassification(BaseTask):
             batch_size=batch_size,
             input_size=input_size,
             epochs=epochs,
+            final_fit_epochs=final_fit_epochs,
             verbose=verbose,
             num_workers=nthreads_per_trial,
             hybridize=hybridize,
             final_fit=False,
             tricks=tricks,
             lr_config=lr_config
-            )
+        )
 
         scheduler_options = {
             'resource': {'num_cpus': nthreads_per_trial, 'num_gpus': ngpus_per_trial},
@@ -270,20 +274,25 @@ class ImageClassification(BaseTask):
             'dist_ip_addrs': dist_ip_addrs,
             'searcher': search_strategy,
             'search_options': search_options,
-            'plot_results': plot_results,
+            'plot_results': plot_results
         }
         if search_strategy == 'hyperband':
-            scheduler_options.update({
-                'searcher': 'random',
-                'max_t': epochs,
-                'grace_period': grace_period if grace_period else epochs//4})
+            scheduler_options.update(
+                {
+                    'searcher': 'random',
+                    'max_t': epochs,
+                    'grace_period': grace_period if grace_period else epochs // 4
+                }
+            )
 
-        results = BaseTask.run_fit(train_image_classification, search_strategy,
-                                   scheduler_options)
+        results = BaseTask.run_fit(train_image_classification, search_strategy, scheduler_options)
         args = sample_config(train_image_classification.args, results['best_config'])
-        model = get_network(args.net, results['num_classes'], mx.cpu(0))
+
+        kwargs = {'num_classes': results['num_classes'], 'ctx': mx.cpu(0)}
+        model = get_network(args.net, **kwargs)
         multi_precision = optimizer.kwvars['multi_precision'] if 'multi_precision' in optimizer.kwvars else False
         update_params(model, results.pop('model_params'), multi_precision)
+
         if ensemble > 1:
             models = [model]
             if isinstance(search_strategy, str):
@@ -295,8 +304,14 @@ class ImageClassification(BaseTask):
             scheduler = scheduler(train_image_classification, **scheduler_options)
             for i in range(1, ensemble):
                 resultsi = scheduler.run_with_config(results['best_config'])
-                model = get_network(args.net, resultsi['num_classes'], mx.cpu(0))
+                kwargs = {'num_classes': resultsi['num_classes'], 'ctx': mx.cpu(0)}
+                model = get_network(args.net, **kwargs)
                 update_params(model, resultsi.pop('model_params'), multi_precision)
                 models.append(model)
             model = Ensemble(models)
+
+        results.pop('args')
+        args.pop('optimizer')
+        args.pop('dataset')
+        args.pop('loss')
         return Classifier(model, results, default_val_fn, checkpoint, args)

@@ -174,7 +174,7 @@ class RLScheduler(FIFOScheduler):
                 task = Task(self.train_fn, {'args': self.args, 'config': config},
                             DistributedResource(**self.resource))
                 # start training task
-                reporter = DistStatusReporter()
+                reporter = DistStatusReporter(remote=task.resources.node)
                 task.args['reporter'] = reporter
                 task_thread = self.add_job(task)
 
@@ -237,7 +237,11 @@ class RLScheduler(FIFOScheduler):
             config = task.args['config']
             while not task_job.done():
                 reported_result = reporter.fetch()
-                #print('reported_result', reported_result)
+                if 'traceback' in reported_result:
+                    logger.exception(reported_result['traceback'])
+                    reporter.move_on()
+                    break
+
                 if 'done' in reported_result and reported_result['done'] is True:
                     reporter.move_on()
                     break
@@ -293,10 +297,7 @@ class RLScheduler(FIFOScheduler):
         cls = RLScheduler
         cls.RESOURCE_MANAGER._request(task.resources)
         # main process
-        #task_thread = threading.Thread(target=cls._start_distributed_job, args=(
-        #                               task, cls.RESOURCE_MANAGER, self.env_sem))
-        #task_thread.start()
-        job = cls._start_distributed_job(task, cls.RESOURCE_MANAGER, self.env_sem)
+        job = cls._start_distributed_job(task, cls.RESOURCE_MANAGER)
         return job
 
     def join_tasks(self):

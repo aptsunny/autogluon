@@ -7,13 +7,15 @@ def get_fixed_params():
     """ Parameters that currently cannot be searched during HPO """
     fixed_params = {
         'num_epochs': 300,  # maximum number of epochs for training NN
+        'epochs_wo_improve': 20,  # we terminate training if validation performance hasn't improved in the last 'epochs_wo_improve' # of epochs
+        # TODO: Epochs could take a very long time, we may want smarter logic than simply # of epochs without improvement (slope, difference in score, etc.)
         'seed_value': None,  # random seed for reproducibility (set = None to ignore)
         # For data processing:
         'proc.embed_min_categories': 4,  # apply embedding layer to categorical features with at least this many levels. Features with fewer levels are one-hot encoded. Choose big value to avoid use of Embedding layers
         # Options: [3,4,10, 100, 1000]
         'proc.impute_strategy': 'median',  # # strategy argument of sklearn.SimpleImputer() used to impute missing numeric values
         # Options: ['median', 'mean', 'most_frequent']
-        'proc.max_category_levels': 500,  # maximum number of allowed levels per categorical feature
+        'proc.max_category_levels': 100,  # maximum number of allowed levels per categorical feature
         # Options: [10, 100, 200, 300, 400, 500, 1000, 10000]
         'proc.skew_threshold': 0.99,  # numerical features whose absolute skewness is greater than this receive special power-transform preprocessing. Choose big value to avoid using power-transforms
         # Options: [0.2, 0.3, 0.5, 0.8, 1.0, 10.0, 100.0]
@@ -35,7 +37,7 @@ def get_hyper_params():
         'numeric_embed_dim': None,  # Size of joint embedding for all numeric+one-hot features.
         # Options: integer values between 10-10000
         'activation': 'relu',  # Activation function
-        # Options: ['relu', 'softrelu' 'elu'??, 'tanh']
+        # Options: ['relu', 'softrelu', 'tanh', 'softsign']
         'max_layer_width': 2056,  # maximum number of hidden units in network layer (integer > 0)
         # Does not need to be searched by default
         'embedding_size_factor': 1.0,  # scaling factor to adjust size of embedding layers (float > 0)
@@ -60,8 +62,13 @@ def get_hyper_params():
         'weight_decay': 1e-6,  # weight decay regularizer (float > 0)
         'clip_gradient': 100.0,  # gradient clipping threshold (float > 0)
         'momentum': 0.9,  # momentum which is only used for SGD optimizer
-        'epochs_wo_improve': 20,  # we terminate training if validation performance hasn't improved in the last 'epochs_wo_improve' # of epochs
-        # TODO: Epochs could take a very long time, we may want smarter logic than simply # of epochs without improvement (slope, difference in score, etc.)
+        'lr_scheduler': None,  # If not None, string specifying what type of learning rate scheduler to use (may override learning_rate).
+        # Options: [None, 'cosine', 'step', 'poly', 'constant']
+        # Below are hyperparameters specific to the LR scheduler (only used if lr_scheduler != None). For more info, see: https://gluon-cv.mxnet.io/api/utils.html#gluoncv.utils.LRScheduler
+        'base_lr': 3e-5, # smallest LR (float > 0)
+        'target_lr': 1.0, # largest LR (float > 0)
+        'lr_decay': 0.1, # step factor used to decay LR (float in (0,1))
+        'warmup_epochs': 10, # number of epochs at beginning of training in which LR is linearly ramped up (float > 1).
     }
     return hyper_params
 
