@@ -1,6 +1,7 @@
 import copy, time, traceback, logging
 import os
 from typing import List
+import networkx as nx
 import numpy as np
 import pandas as pd
 from pandas import DataFrame, Series
@@ -102,6 +103,7 @@ class AbstractTrainer:
         self.model_fit_times = {}
         self.model_pred_times = {}
         self.models = {}
+        self.model_graph = nx.DiGraph()
         self.reset_paths = False
 
         self.hpo_results = {}  # Stores summary of HPO process
@@ -276,12 +278,9 @@ class AbstractTrainer:
                 if score is None:
                     model.predict_time = None
                 else:
-                    # TODO: Correct weighted ensembles + compressed models to have either None pred time or 0 pred time
                     model.predict_time = pred_end_time - fit_end_time
-            if model.val_score is None:
-                model.val_score = score
+            model.val_score = score
             # TODO: Add recursive=True to avoid repeatedly loading models each time this is called for bagged ensembles (especially during repeated bagging)
-            # model.save_info()  # TODO: Potentially add parameter to avoid doing this if specified
             self.save_model(model=model)
         except TimeLimitExceeded:
             logger.log(20, '\tTime limit exceeded... Skipping %s.' % model.name)
@@ -322,6 +321,10 @@ class AbstractTrainer:
         self.model_fit_times[model.name] = model.fit_time
         self.model_pred_times[model.name] = model.predict_time
         if model.is_valid():
+            self.model_graph.add_node(model.name, fit_time=model.fit_time, predict_time=model.predict_time, val_score=model.val_score)
+            if isinstance(model, StackerEnsembleModel):
+                for base_model_name in model.base_model_names:
+                    self.model_graph.add_edge(base_model_name, model.name)
             if model.name not in stack_loc[level]:
                 stack_loc[level].append(model.name)
             if self.model_best_core is None:
@@ -728,7 +731,7 @@ class AbstractTrainer:
                     X = X.drop(cols_to_drop, axis=1)
         return X
 
-    # You must have previously called fit() with enable_fit_continuation=True, and either num_bagging_folds > 1 or auto_stack=True.
+    # You must have previously called fit() with cache_data=True
     def refit_single_full(self, X=None, y=None, models=None):
         if X is None:
             X = self.load_X_train()
@@ -831,7 +834,8 @@ class AbstractTrainer:
 
     # TODO: Enable raw=True for bagged models when X=None
     #  This is non-trivial to implement for multi-layer stacking ensembles on the OOF data.
-    def get_feature_importance(self, model=None, X=None, y=None, features=None, raw=True):
+    # TODO: Consider limiting X to 10k rows here instead of inside the model call
+    def get_feature_importance(self, model=None, X=None, y=None, features=None, raw=True, subsample_size=10000, silent=False):
         if model is None:
             model = self.model_best
         model: AbstractModel = self.load_model(model)
@@ -842,7 +846,7 @@ class AbstractTrainer:
             if isinstance(model, WeightedEnsembleModel):
                 if self.bagged_mode:
                     if raw:
-                        raise AssertionError('raw feature importance on the original training data is not supported when bagging is enabled, please specify new test data to compute raw feature importances.')
+                        raise AssertionError('Raw feature importance on the original training data is not yet supported when bagging is enabled, please specify new test data to compute raw feature importances.')
                     X = None
                     is_oof = True
                 else:
@@ -853,7 +857,7 @@ class AbstractTrainer:
                     is_oof = False
             elif isinstance(model, BaggedEnsembleModel):
                 if raw:
-                    raise AssertionError('raw feature importance on the original training data is not supported when bagging is enabled, please specify new test data to compute raw feature importances.')
+                    raise AssertionError('Raw feature importance on the original training data is not yet supported when bagging is enabled, please specify new test data to compute raw feature importances.')
                 X = self.load_X_train()
                 X = self.get_inputs_to_model(model=model, X=X, level_start=0, fit=True)
                 is_oof = True
@@ -868,15 +872,15 @@ class AbstractTrainer:
                 X = self.get_inputs_to_model(model=model, X=X, level_start=0, fit=False)
 
         if y is None and X is not None:
-            if isinstance(model, BaggedEnsembleModel):
+            if is_oof:
                 y = self.load_y_train()
             else:
                 y = self.load_y_val()
 
         if raw:
-            feature_importance = self._get_feature_importance_raw(model=model, X=X, y=y, features_to_use=features)
+            feature_importance = self._get_feature_importance_raw(model=model, X=X, y=y, features_to_use=features, subsample_size=subsample_size, silent=silent)
         else:
-            feature_importance = model.compute_feature_importance(X=X, y=y, features_to_use=features, is_oof=is_oof)
+            feature_importance = model.compute_feature_importance(X=X, y=y, features_to_use=features, subsample_size=subsample_size, is_oof=is_oof, silent=silent)
         return feature_importance
 
     # TODO: Can get feature importances of all children of model at no extra cost, requires scoring the values after predict_proba on each model
@@ -888,25 +892,48 @@ class AbstractTrainer:
     #  This is different from raw, where the predictions of the folds are averaged and then feature importance is computed.
     #  Consider aligning these methods so they produce the same result.
     # The output of this function is identical to non-raw when model is level 0 and non-bagged
-    def _get_feature_importance_raw(self, model, X, y, features_to_use=None):
+    def _get_feature_importance_raw(self, model, X, y, features_to_use=None, subsample_size=10000, silent=False):
+        time_start = time.time()
         model: AbstractModel = self.load_model(model)
         if features_to_use is None:
             features_to_use = list(X.columns)
+        feature_count = len(features_to_use)
 
+        if not silent:
+            logger.log(20, f'Computing raw permutation importance for {feature_count} features on {model.name} ...')
+
+        if (subsample_size is not None) and (len(X) > subsample_size):
+            X = X.sample(subsample_size, random_state=0)
+            y = y.loc[X.index]
+
+        time_start_score = time.time()
         score_baseline = self.score(X=X, y=y, model=model)
+        time_score = time.time() - time_start_score
+
+        if not silent:
+            time_estimated = (feature_count + 1) * time_score + time_start_score - time_start
+            logger.log(20, f'\t{round(time_estimated, 2)}s\t= Expected runtime')
+
         X_shuffled = shuffle_df_rows(X=X, seed=0)
 
         # Assuming X_test or X_val
         # TODO: Can check multiple features at a time only if non-OOF
-        # TODO: Consider having X_to_check reassign values instead of creating new for each feature
         permutation_importance_dict = dict()
+        X_to_check = X.copy()
+        last_processed = None
         for feature in features_to_use:
-            X_to_check = X.copy()
+            if last_processed is not None:  # resetting original values
+                X_to_check[last_processed] = X[last_processed].values
             X_to_check[feature] = X_shuffled[feature].values
             score_feature = self.score(X=X_to_check, y=y, model=model)
             score_diff = score_baseline - score_feature
             permutation_importance_dict[feature] = score_diff
+            last_processed = feature
         feature_importances = pd.Series(permutation_importance_dict).sort_values(ascending=False)
+
+        if not silent:
+            logger.log(20, f'\t{round(time.time() - time_start, 2)}s\t= Actual runtime')
+
         return feature_importances
 
     def get_models_load_info(self, model_names):
@@ -915,26 +942,52 @@ class AbstractTrainer:
         model_types = {model_name: self.model_types[model_name] for model_name in model_names}
         return model_names, model_paths, model_types
 
-    # TODO: Add pred_time_val_full (Will be incorrect unless graph representation is added)
+    # Sums the attribute value across all models that the provided model depends on, including itself.
+    # For instance, this function can return the expected total predict_time of a model.
+    # attribute is the name of the desired attribute to be summed.
+    def get_model_attribute_full(self, model, attribute):
+        base_model_set = self.get_minimum_model_set(model)
+        if len(base_model_set) == 1:
+            return self.model_graph.nodes[base_model_set[0]][attribute]
+        attribute_full = 0
+        for base_model in base_model_set:
+            if self.model_graph.nodes[base_model][attribute] is None:
+                return None
+            attribute_full += self.model_graph.nodes[base_model][attribute]
+        return attribute_full
+
+    # Gets the minimum set of models that the provided model depends on, including itself
+    # Returns a list of model names
+    def get_minimum_model_set(self, model):
+        if not isinstance(model, str):
+            model = model.name
+        return list(nx.bfs_tree(self.model_graph, model, reverse=True))
+
     def leaderboard(self):
         model_names = self.get_model_names_all()
         score_val = []
+        fit_time_marginal = []
+        pred_time_val_marginal = []
+        stack_level = []
         fit_time = []
         pred_time_val = []
-        stack_level = []
         for model_name in model_names:
             score_val.append(self.model_performance.get(model_name))
-            fit_time.append(self.model_fit_times.get(model_name))
-            pred_time_val.append(self.model_pred_times.get(model_name))
+            fit_time_marginal.append(self.model_fit_times.get(model_name))
+            fit_time.append(self.get_model_attribute_full(model=model_name, attribute='fit_time'))
+            pred_time_val_marginal.append(self.model_pred_times.get(model_name))
+            pred_time_val.append(self.get_model_attribute_full(model=model_name, attribute='predict_time'))
             stack_level.append(self.get_model_level(model_name))
         df = pd.DataFrame(data={
             'model': model_names,
             'score_val': score_val,
-            'fit_time': fit_time,
             'pred_time_val': pred_time_val,
+            'fit_time': fit_time,
+            'pred_time_val_marginal': pred_time_val_marginal,
+            'fit_time_marginal': fit_time_marginal,
             'stack_level': stack_level,
         })
-        df_sorted = df.sort_values(by=['score_val', 'model'], ascending=False)
+        df_sorted = df.sort_values(by=['score_val', 'pred_time_val', 'model'], ascending=[False, True, False]).reset_index(drop=True)
         return df_sorted
 
     def get_info(self, include_model_info=False):

@@ -84,6 +84,7 @@ class TabularPredictor(BasePredictor):
                 If str is passed, `dataset` will be loaded using the str value as the file path.
             model : str (optional)
                 The name of the model to get predictions from. Defaults to None, which uses the highest scoring model on the validation set.
+                Valid models are listed in this `predictor` by calling `predictor.model_names`
             as_pandas : bool (optional)
                 Whether to return the output as a pandas Series (True) or numpy array (False)
             use_pred_cache : bool (optional)
@@ -112,6 +113,7 @@ class TabularPredictor(BasePredictor):
                 If str is passed, `dataset` will be loaded using the str value as the file path.
             model : str (optional)
                 The name of the model to get prediction probabilities from. Defaults to None, which uses the highest scoring model on the validation set.
+                Valid models are listed in this `predictor` by calling `predictor.model_names`
             as_pandas : bool (optional)
                 Whether to return the output as a pandas object (True) or numpy array (False).
                 Pandas object is a DataFrame if this is a multiclass problem, otherwise it is a Series.
@@ -152,6 +154,7 @@ class TabularPredictor(BasePredictor):
 
     def evaluate_predictions(self, y_true, y_pred, silent=False, auxiliary_metrics=False, detailed_report=True):
         """ Evaluate the provided predictions against ground truth labels.
+            Evaluation is based on the `eval_metric` previously specifed to `fit()`, or default metrics if none was specified.
 
             Parameters
             ----------
@@ -159,7 +162,7 @@ class TabularPredictor(BasePredictor):
                 The ordered collection of ground-truth labels.
             y_pred : list or `numpy.array`
                 The ordered collection of predictions.
-                For certain types of `eval_metric` (such as AUC), `y_pred` must be predicted-probabilities rather than predicted labels.
+                Caution: For certain types of `eval_metric` (such as 'roc_auc'), `y_pred` must be predicted-probabilities rather than predicted labels.
             silent : bool (optional)
                 Should performance results be printed?
             auxiliary_metrics: bool (optional)
@@ -175,19 +178,40 @@ class TabularPredictor(BasePredictor):
         return self._learner.evaluate(y_true=y_true, y_pred=y_pred, silent=silent,
                                       auxiliary_metrics=auxiliary_metrics, detailed_report=detailed_report)
 
-    def leaderboard(self, dataset=None, silent=False):
+    def leaderboard(self, dataset=None, only_pareto_frontier=False, silent=False):
         """
             Output summary of information about models produced during fit() as a pandas DataFrame.
-            Includes information on test and validation scores for all models, model training times and stack levels.
+            Includes information on test and validation scores for all models, model training times, inference times, and stack levels.
+            Output DataFrame columns include:
+                'model': The name of the model.
+                'score_val': The validation score of the model on the 'eval_metric'.
+                'pred_time_val': The inference time required to compute predictions on the validation data end-to-end.
+                    Equivalent to the sum of all 'pred_time_val_marginal' values for the model and all of its base models.
+                'fit_time': The fit time required to train the model end-to-end (Including base models if the model is a stack ensemble).
+                    Equivalent to the sum of all 'fit_time_marginal' values for the model and all of its base models.
+                'pred_time_val_marginal': The inference time required to compute predictions on the validation data (Ignoring inference times for base models).
+                    Note that this ignores the time required to load the model into memory when bagging is disabled.
+                'fit_time_marginal': The fit time required to train the model (Ignoring base models).
+                'stack_level': The stack level of the model.
+                    A model with stack level N can take any set of models with stack level less than N as input, with stack level 0 models having no model inputs.
 
             Parameters
             ----------
             dataset : str or :class:`TabularDataset` or `pandas.DataFrame` (optional)
                 This Dataset must also contain the label-column with the same column-name as specified during fit().
-                If specified, then the leaderboard returned will contain an additional column 'score_test'
-                'score_test' is the score of the model on the validation_metric for the dataset provided
+                If specified, then the leaderboard returned will contain additional columns 'score_test', 'pred_time_test', and 'pred_time_test_marginal'.
+                    'score_test': The score of the model on the 'eval_metric' for the dataset provided.
+                    'pred_time_test': The true end-to-end wall-clock inference time of the model for the dataset provided.
+                        Equivalent to the sum of all 'pred_time_test_marginal' values for the model and all of its base models.
+                    'pred_time_test_marginal': The inference time of the model for the dataset provided, minus the inference time for the model's base models, if it has any.
+                        Note that this ignores the time required to load the model into memory when bagging is disabled.
                 If str is passed, `dataset` will be loaded using the str value as the file path.
-            silent: bool (optional)
+            only_pareto_frontier : bool (optional)
+                If `True`, only return model information of models in the Pareto frontier of the accuracy/latency trade-off (models which achieve the highest score within their end-to-end inference time).
+                At minimum this will include the model with the highest score and the model with the lowest inference time.
+                This is useful when deciding which model to use during inference if inference time is a consideration.
+                Models filtered out by this process would never be optimal choices for a user that only cares about model inference time and score.
+            silent : bool (optional)
                 Should leaderboard DataFrame be printed?
 
             Returns
@@ -195,7 +219,7 @@ class TabularPredictor(BasePredictor):
             Pandas `pandas.DataFrame` of model performance summary information.
         """
         dataset = self.__get_dataset(dataset) if dataset is not None else dataset
-        return self._learner.leaderboard(X=dataset, silent=silent)
+        return self._learner.leaderboard(X=dataset, only_pareto_frontier=only_pareto_frontier, silent=silent)
 
     def fit_summary(self, verbosity=3):
         """
@@ -315,6 +339,53 @@ class TabularPredictor(BasePredictor):
             print("*** End of fit() summary ***")
         return results
 
+    # TODO: Consider adding time_limit option to early stop the feature importance process
+    def feature_importance(self, model=None, dataset=None, features=None, raw=True, subsample_size=10000, silent=False):
+        """
+        Calculates feature importance scores for the given model.
+        A feature's importance score represents the performance drop that results when the model makes predictions on a perturbed copy of the dataset where this feature's values have been randomly shuffled across rows.
+        A feature score of 0.01 would indicate that the predictive performance dropped by 0.01 when the feature was randomly shuffled.
+        The higher the score a feature has, the more important it is to the model's performance.
+        If a feature has a negative score, this means that the feature is likely harmful to the final model, and a model trained with the feature removed would be expected to achieve a better predictive performance.
+        Note that calculating feature importance can be a very computationally expensive process, particularly if the model uses hundreds or thousands of features. In many cases, this can take longer than the original model training.
+        To estimate how long `feature_importance(model, dataset, features)` will take, it is roughly the time taken by `predict_proba(dataset, model)` multiplied by the number of features.
+
+        Parameters
+        ----------
+        model : str, default = None
+            Model to get feature importances for, if None the best model is chosen.
+            Valid models are listed in this `predictor` by calling `predictor.model_names`
+        dataset : str or :class:`TabularDataset` or `pandas.DataFrame` (optional)
+            This Dataset must also contain the label-column with the same column-name as specified during fit().
+            If specified, then the dataset is used to calculate the feature importance scores.
+            If str is passed, `dataset` will be loaded using the str value as the file path.
+            If not specified, the original dataset used during fit() will be used if `cache_data=True`. Otherwise, an exception will be raised.
+            Do not pass the training data through this argument, as the feature importance scores calculated will be inaccurate.
+        features : list, default = None
+            List of str feature names that feature importances are calculated for and returned, specify None to get all feature importances.
+            If you only want to compute feature importances for some of the features, you can pass their names in as a list of str.
+        raw : bool, default = True
+            Whether to compute feature importance on raw features in the original data (after automated feature engineering) or on the features used by the particular model.
+            For example, a stacker model uses both the original features and the predictions of the lower-level models.
+            Note that for bagged models, feature importance calculation is not yet supported when both `raw=True` and `dataset=None`. Doing so will raise an exception.
+        subsample_size : int, default = 10000
+            The number of rows to sample from `dataset` when computing feature importance.
+            If `subsample_size=None` or `dataset` contains fewer than `subsample_size` rows, all rows will be used during computation.
+            Larger values increase the accuracy of the feature importance scores.
+            Runtime linearly scales with `subsample_size`.
+        silent : bool, default = False
+            Whether to suppress logging output
+
+        Returns
+        -------
+        Pandas `pandas.Series` of feature importance scores.
+
+        """
+        if (dataset is None) and (not self._trainer.is_data_saved):
+            raise AssertionError('No dataset was provided and there is no cached data to load for feature importance calculation. `cache_data=True` must be set in the `TabularPrediction.fit()` call to enable this functionality when dataset is not specified.')
+
+        return self._learner.get_feature_importance(model=model, X=dataset, features=features, raw=raw, subsample_size=subsample_size, silent=silent)
+
     @classmethod
     def load(cls, output_directory, verbosity=2):
         """
@@ -349,7 +420,7 @@ class TabularPredictor(BasePredictor):
             (we do not recommend modifying the Predictor object yourself as it tracks many trained models).
         """
         self._learner.save()
-        logger.log(20, "TabularPredictor saved. To load, use: TabularPredictor.load(%s)" % self.output_directory)
+        logger.log(20, "TabularPredictor saved. To load, use: TabularPredictor.load(\"%s\")" % self.output_directory)
 
     @staticmethod
     def _summarize(key, msg, results):

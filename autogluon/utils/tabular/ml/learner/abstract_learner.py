@@ -16,7 +16,7 @@ from sklearn.metrics import mean_absolute_error, explained_variance_score, r2_sc
 from ..constants import BINARY, MULTICLASS, REGRESSION
 from ..trainer.abstract_trainer import AbstractTrainer
 from ..tuning.ensemble_selection import EnsembleSelection
-from ..utils import get_pred_from_proba
+from ..utils import get_pred_from_proba, get_leaderboard_pareto_frontier
 from ...data.label_cleaner import LabelCleaner
 from ...utils.loaders import load_pkl, load_pd
 from ...utils.savers import save_pkl, save_pd, save_json
@@ -124,10 +124,7 @@ class AbstractLearner:
 
         if len(X_test_cache_miss) > 0:
             y_pred_proba = self.predict_proba(X_test=X_test_cache_miss, model=model, inverse_transform=False, sample=sample)
-            if self.trainer_problem_type is not None:
-                problem_type = self.trainer_problem_type
-            else:
-                problem_type = self.problem_type
+            problem_type = self.trainer_problem_type or self.problem_type
             y_pred = get_pred_from_proba(y_pred_proba=y_pred_proba, problem_type=problem_type)
             y_pred = self.label_cleaner.inverse_transform(pd.Series(y_pred))
             y_pred.index = X_test_cache_miss.index
@@ -161,8 +158,7 @@ class AbstractLearner:
     # y should be y_train from original fit call, if None then load saved y_train in trainer (if save_data=True)
     # Compresses bagged ensembles to a single model fit on 100% of the data.
     # Results in worse model quality (-), but much faster inference times (+++), reduced memory usage (+++), and reduced space usage (+++).
-    # TODO: this currently only works for bagged models.
-    # You must have previously called fit() with enable_fit_continuation=True, and either num_bagging_folds > 1 or auto_stack=True.
+    # You must have previously called fit() with cache_data=True.
     def refit_single_full(self, models=None):
         X = None
         y = None
@@ -205,7 +201,7 @@ class AbstractLearner:
             return trainer.score(X=X, y=y, model=model)
 
     # Scores both learner and all individual models, along with computing the optimal ensemble score + weights (oracle)
-    def score_debug(self, X: DataFrame, y=None, silent=False):
+    def score_debug(self, X: DataFrame, y=None, compute_oracle=False, silent=False):
         if y is None:
             X, y = self.extract_label(X)
         X = self.transform_features(X)
@@ -220,9 +216,7 @@ class AbstractLearner:
 
         max_level_to_check = trainer.get_max_level_all()
         scores = {}
-        pred_times = {}
-        pred_times_full = {}
-        pred_time_offset = 0
+        pred_time_test_marginal = {}
         pred_probas = None
         stack_names = list(trainer.models_level.keys())
         stack_names_not_core = [name for name in stack_names if name != 'core']
@@ -236,8 +230,7 @@ class AbstractLearner:
                     pred_probas_auxiliary, pred_probas_time_auxiliary = self.get_pred_probas_models_and_time(X=X_stack, trainer=trainer, model_names=model_names_aux)
                     for i, model_name in enumerate(model_names_aux):
                         pred_proba = pred_probas_auxiliary[i]
-                        pred_times[model_name] = pred_probas_time_auxiliary[i]
-                        pred_times_full[model_name] = pred_probas_time_auxiliary[i] + pred_time_offset
+                        pred_time_test_marginal[model_name] = pred_probas_time_auxiliary[i]
                         if (trainer.problem_type == BINARY) and (self.problem_type == MULTICLASS):
                             pred_proba = self.label_cleaner.inverse_transform_proba(pred_proba)
 
@@ -252,8 +245,7 @@ class AbstractLearner:
                 pred_probas, pred_probas_time = self.get_pred_probas_models_and_time(X=X_stack, trainer=trainer, model_names=model_names_core)
                 for i, model_name in enumerate(model_names_core):
                     pred_proba = pred_probas[i]
-                    pred_times[model_name] = pred_probas_time[i]
-                    pred_times_full[model_name] = pred_probas_time[i] + pred_time_offset
+                    pred_time_test_marginal[model_name] = pred_probas_time[i]
                     if (trainer.problem_type == BINARY) and (self.problem_type == MULTICLASS):
                         pred_proba = self.label_cleaner.inverse_transform_proba(pred_proba)
 
@@ -262,24 +254,39 @@ class AbstractLearner:
                         scores[model_name] = self.objective_func(y, pred)
                     else:
                         scores[model_name] = self.objective_func(y, pred_proba)
-                pred_time_offset += sum(pred_probas_time)
 
-                ensemble_selection = EnsembleSelection(ensemble_size=100, problem_type=trainer.problem_type, metric=self.objective_func)
-                ensemble_selection.fit(predictions=pred_probas, labels=y, identifiers=None)
-                oracle_weights = ensemble_selection.weights_
-                oracle_pred_time_start = time.time()
-                oracle_pred_proba_norm = [pred * weight for pred, weight in zip(pred_probas, oracle_weights)]
-                oracle_pred_proba_ensemble = np.sum(oracle_pred_proba_norm, axis=0)
-                if (trainer.problem_type == BINARY) and (self.problem_type == MULTICLASS):
-                    oracle_pred_proba_ensemble = self.label_cleaner.inverse_transform_proba(oracle_pred_proba_ensemble)
-                oracle_pred_time = time.time() - oracle_pred_time_start
-                pred_times[f'oracle_ensemble_l' + str(level + 1)] = oracle_pred_time
-                pred_times_full['oracle_ensemble_l' + str(level + 1)] = oracle_pred_time + pred_time_offset
-                if trainer.objective_func_expects_y_pred:
-                    oracle_pred_ensemble = get_pred_from_proba(y_pred_proba=oracle_pred_proba_ensemble, problem_type=self.problem_type)
-                    scores['oracle_ensemble_l' + str(level + 1)] = self.objective_func(y, oracle_pred_ensemble)
+                if compute_oracle:
+                    ensemble_selection = EnsembleSelection(ensemble_size=100, problem_type=trainer.problem_type, metric=self.objective_func)
+                    ensemble_selection.fit(predictions=pred_probas, labels=y, identifiers=None)
+                    oracle_weights = ensemble_selection.weights_
+                    oracle_pred_time_start = time.time()
+                    oracle_pred_proba_norm = [pred * weight for pred, weight in zip(pred_probas, oracle_weights)]
+                    oracle_pred_proba_ensemble = np.sum(oracle_pred_proba_norm, axis=0)
+                    if (trainer.problem_type == BINARY) and (self.problem_type == MULTICLASS):
+                        oracle_pred_proba_ensemble = self.label_cleaner.inverse_transform_proba(oracle_pred_proba_ensemble)
+                    oracle_pred_time = time.time() - oracle_pred_time_start
+                    pred_time_test_marginal[f'oracle_ensemble_l' + str(level + 1)] = oracle_pred_time
+                    if trainer.objective_func_expects_y_pred:
+                        oracle_pred_ensemble = get_pred_from_proba(y_pred_proba=oracle_pred_proba_ensemble, problem_type=self.problem_type)
+                        scores['oracle_ensemble_l' + str(level + 1)] = self.objective_func(y, oracle_pred_ensemble)
+                    else:
+                        scores['oracle_ensemble_l' + str(level + 1)] = self.objective_func(y, oracle_pred_proba_ensemble)
+
+        pred_time_test = {}
+        all_trained_models = trainer.get_model_names_all()
+        # TODO: Add support for calculating pred_time_test_full for oracle_ensemble, need to copy graph from trainer and add oracle_ensemble to it with proper edges.
+        for model in scores.keys():
+            if model in all_trained_models:
+                base_model_set = trainer.get_minimum_model_set(model)
+                if len(base_model_set) == 1:
+                    pred_time_test[model] = pred_time_test_marginal[base_model_set[0]]
                 else:
-                    scores['oracle_ensemble_l' + str(level + 1)] = self.objective_func(y, oracle_pred_proba_ensemble)
+                    pred_time_test_full_num = 0
+                    for base_model in base_model_set:
+                        pred_time_test_full_num += pred_time_test_marginal[base_model]
+                    pred_time_test[model] = pred_time_test_full_num
+            else:
+                pred_time_test[model] = None
 
         logger.debug('Model scores:')
         logger.debug(str(scores))
@@ -287,34 +294,33 @@ class AbstractLearner:
             data={
                 'model': list(scores.keys()),
                 'score_test': list(scores.values()),
-                'pred_time_test': [pred_times[model] for model in scores.keys()],
-                'pred_time_test_full': [pred_times_full[model] for model in scores.keys()],
+                'pred_time_test': [pred_time_test[model] for model in scores.keys()],
+                'pred_time_test_marginal': [pred_time_test_marginal[model] for model in scores.keys()],
             }
         )
 
-        df = df.sort_values(by='score_test', ascending=False).reset_index(drop=True)
+        df = df.sort_values(by=['score_test', 'pred_time_test'], ascending=[False, True]).reset_index(drop=True)
 
         leaderboard_df = self.leaderboard(silent=silent)
 
-        df_merged = pd.merge(df, leaderboard_df, on='model')
+        df_merged = pd.merge(df, leaderboard_df, on='model', how='left')
         df_columns_lst = df_merged.columns.tolist()
         explicit_order = [
             'model',
             'score_test',
             'score_val',
-            'fit_time',
-            'pred_time_test_full',
             'pred_time_test',
             'pred_time_val',
+            'fit_time',
+            'pred_time_test_marginal',
+            'pred_time_val_marginal',
+            'fit_time_marginal',
             'stack_level',
         ]
         df_columns_other = [column for column in df_columns_lst if column not in explicit_order]
         df_columns_new = explicit_order + df_columns_other
         df_merged = df_merged[df_columns_new]
 
-        # TODO: Fix pred_time_test_full value for weighted_ensembles / models who only have X base_models instead of the full level.
-        #  Currently it is over-estimating prediction time
-        #  Fix by implementing DAG representation
         return df_merged
 
     def get_pred_probas_models_and_time(self, X, trainer, model_names):
@@ -332,6 +338,22 @@ class AbstractLearner:
             pred_probas_time_lst.append(time_diff)
         return pred_probas_lst, pred_probas_time_lst
 
+    def _remove_missing_labels(self, y_true, y_pred):
+        """Removes missing labels and produces warning if any are found."""
+        if self.problem_type == REGRESSION:
+            non_missing_boolean_mask = [(y is not None and not np.isnan(y)) for y in y_true]
+        else:
+            non_missing_boolean_mask = [(y is not None and y != '') for y in y_true]
+
+        n_missing = len([x for x in non_missing_boolean_mask if not x])
+        if n_missing > 0:
+            y_true = y_true[non_missing_boolean_mask]
+            y_pred = y_pred[non_missing_boolean_mask]
+            warnings.warn(f"There are {n_missing} (out of {len(y_true)}) evaluation datapoints for which the label is missing. "
+                          f"AutoGluon removed these points from the evaluation, which thus may not be entirely representative. "
+                          f"You should carefully study why there are missing labels in your evaluation data.")
+        return y_true, y_pred
+
     def evaluate(self, y_true, y_pred, silent=False, auxiliary_metrics=False, detailed_report=True, high_always_good=False):
         """ Evaluate predictions.
             Args:
@@ -343,73 +365,79 @@ class AbstractLearner:
             Returns single performance-value if auxiliary_metrics=False.
             Otherwise returns dict where keys = metrics, values = performance along each metric.
         """
+        assert isinstance(y_true, (np.ndarray, pd.Series))
+        assert isinstance(y_pred, (np.ndarray, pd.Series))
 
-        # Remove missing labels and produce warning if any are found:
-        if self.problem_type == REGRESSION:
-            missing_indicators = [(y is None or np.isnan(y)) for y in y_true]
+        y_true, y_pred = self._remove_missing_labels(y_true, y_pred)
+        trainer = self.load_trainer()
+        if trainer.objective_func_expects_y_pred:
+            y_pred_cleaned = self.label_cleaner.transform(y_pred)
+            y_true_cleaned = self.label_cleaner.transform(y_true)
+            if self.problem_type == MULTICLASS:
+                y_true_cleaned = y_true_cleaned.fillna(-1)  # map unknown classes to -1
+            performance = self.objective_func(y_true_cleaned, y_pred_cleaned)
         else:
-            missing_indicators = [(y is None or y == '') for y in y_true]
-        missing_inds = [i for i, j in enumerate(missing_indicators) if j]
-        if len(missing_inds) > 0:
-            nonmissing_inds = [i for i, j in enumerate(missing_indicators) if not j]
-            y_true = y_true[nonmissing_inds]
-            y_pred = y_pred[nonmissing_inds]
-            warnings.warn(f"There are {len(missing_inds)} (out of {len(y_true)}) evaluation datapoints for which the label is missing. "
-                          f"AutoGluon removed these points from the evaluation, which thus may not be entirely representative. "
-                          f"You should carefully study why there are missing labels in your evaluation data.")
+            performance = self.objective_func(y_true, y_pred)
 
-        perf = self.objective_func(y_true, y_pred)
         metric = self.objective_func.name
+
         if not high_always_good:
             sign = self.objective_func._sign
-            perf = perf * sign  # flip negative once again back to positive (so higher is no longer necessarily better)
+            performance = performance * sign  # flip negative once again back to positive (so higher is no longer necessarily better)
+
         if not silent:
-            logger.log(20, f"Evaluation: {metric} on test data: {perf}")
+            logger.log(20, f"Evaluation: {metric} on test data: {performance}")
+
         if not auxiliary_metrics:
-            return perf
+            return performance
 
         # Otherwise compute auxiliary metrics:
-        perf_dict = OrderedDict({metric: perf})
-        if self.problem_type == REGRESSION:  # Additional metrics: R^2, Mean-Absolute-Error, Pearson correlation
+        auxiliary_metrics = []
+        if self.problem_type == REGRESSION:  # Adding regression metrics
             pearson_corr = lambda x, y: corrcoef(x, y)[0][1]
             pearson_corr.__name__ = 'pearson_correlation'
-            regression_metrics = [
+            auxiliary_metrics += [
                 mean_absolute_error, explained_variance_score, r2_score, pearson_corr, mean_squared_error, median_absolute_error,
                 # max_error
             ]
-            for reg_metric in regression_metrics:
-                metric_name = reg_metric.__name__
-                if metric_name not in perf_dict:
-                    perf_dict[metric_name] = reg_metric(y_true, y_pred)
-        else:  # Compute classification metrics
-            classif_metrics = [accuracy_score, balanced_accuracy_score, matthews_corrcoef]
+        else:  # Adding classification metrics
+            auxiliary_metrics += [accuracy_score, balanced_accuracy_score, matthews_corrcoef]
             if self.problem_type == BINARY:  # binary-specific metrics
                 # def auc_score(y_true, y_pred): # TODO: this requires y_pred to be probability-scores
                 #     fpr, tpr, _ = roc_curve(y_true, y_pred, pos_label)
                 #   return auc(fpr, tpr)
                 f1micro_score = lambda y_true, y_pred: f1_score(y_true, y_pred, average='micro')
                 f1micro_score.__name__ = f1_score.__name__
-                classif_metrics += [f1micro_score]  # TODO: add auc?
+                auxiliary_metrics += [f1micro_score]  # TODO: add auc?
             elif self.problem_type == MULTICLASS:  # multiclass metrics
-                classif_metrics += []  # TODO: No multi-class specific metrics for now. Include, top-1, top-5, top-10 accuracy here.
-            for cl_metric in classif_metrics:
-                metric_name = cl_metric.__name__
-                if metric_name not in perf_dict:
-                    perf_dict[metric_name] = cl_metric(y_true, y_pred)
+                auxiliary_metrics += []  # TODO: No multi-class specific metrics for now. Include top-5, top-10 accuracy here.
+
+        performance_dict = OrderedDict({metric: performance})
+        for metric_function in auxiliary_metrics:
+            metric_name = metric_function.__name__
+            if metric_name not in performance_dict:
+                try: # only compute auxiliary metrics which do not error (y_pred = class-probabilities may cause some metrics to error)
+                    performance_dict[metric_name] = metric_function(y_true, y_pred)
+                except ValueError:
+                    pass
 
         if not silent:
             logger.log(20, "Evaluations on test data:")
-            logger.log(20, json.dumps(perf_dict, indent=4))
+            logger.log(20, json.dumps(performance_dict, indent=4))
+
         if detailed_report and (self.problem_type != REGRESSION):
             # One final set of metrics to report
             cl_metric = lambda y_true, y_pred: classification_report(y_true, y_pred, output_dict=True)
-            metric_name = cl_metric.__name__
-            if metric_name not in perf_dict:
-                perf_dict[metric_name] = cl_metric(y_true, y_pred)
-                if not silent:
+            metric_name = 'classification_report'
+            if metric_name not in performance_dict:
+                try: # only compute auxiliary metrics which do not error (y_pred = class-probabilities may cause some metrics to error)
+                    performance_dict[metric_name] = cl_metric(y_true, y_pred)
+                except ValueError:
+                    pass
+                if not silent and metric_name in performance_dict:
                     logger.log(20, "Detailed (per-class) classification report:")
-                    logger.log(20, json.dumps(perf_dict[metric_name], indent=4))
-        return perf_dict
+                    logger.log(20, json.dumps(performance_dict[metric_name], indent=4))
+        return performance_dict
 
     def extract_label(self, X):
         if self.label not in list(X.columns):
@@ -441,27 +469,33 @@ class AbstractLearner:
         y_pred_proba = self.predict_proba(X_test=X_test, inverse_transform=False)
         return self.submit_from_preds(X_test=X_test, y_pred_proba=y_pred_proba, save=save, save_proba=save_proba)
 
-    def leaderboard(self, X=None, y=None, silent=False):
+    def leaderboard(self, X=None, y=None, only_pareto_frontier=False, silent=False):
         if X is not None:
             leaderboard = self.score_debug(X=X, y=y, silent=True)
         else:
             trainer = self.load_trainer()
             leaderboard = trainer.leaderboard()
+        if only_pareto_frontier:
+            if 'score_test' in leaderboard.columns and 'pred_time_test' in leaderboard.columns:
+                score_col = 'score_test'
+                inference_time_col = 'pred_time_test'
+            else:
+                score_col = 'score_val'
+                inference_time_col = 'pred_time_val'
+            leaderboard = get_leaderboard_pareto_frontier(leaderboard=leaderboard, score_col=score_col, inference_time_col=inference_time_col)
         if not silent:
             with pd.option_context('display.max_rows', None, 'display.max_columns', None, 'display.width', 1000):
                 print(leaderboard)
         return leaderboard
 
-    # TODO: enable_fit_continuation must be set to True to be able to pass X and y as None in this function, otherwise it will error.
+    # TODO: cache_data must be set to True to be able to pass X and y as None in this function, otherwise it will error.
     # Warning: This can take a very, very long time to compute if the data is large and the model is complex.
-    # TODO: Warning: This is not memory safe, large datasets may result in OOM errors during feature importance calculation.
-    # TODO: Rewrite description before adding to Predictor
     # A value of 0.01 means that the objective metric error would be expected to increase by 0.01 if the feature were removed.
     # Negative values mean the feature is likely harmful.
     # model: model (str) to get feature importances for, if None will choose best model.
     # features: list of feature names that feature importances are calculated for and returned, specify None to get all feature importances.
     # raw: Whether to compute feature importance on raw original features or on the features used by the particular model.
-    def get_feature_importance(self, model=None, X=None, y=None, features: list = None, raw=True) -> Series:
+    def get_feature_importance(self, model=None, X=None, y=None, features: list = None, raw=True, subsample_size=10000, silent=False) -> Series:
         if X is not None:
             if y is None:
                 X, y = self.extract_label(X)
@@ -470,7 +504,7 @@ class AbstractLearner:
         else:
             y = None
         trainer = self.load_trainer()
-        return trainer.get_feature_importance(X=X, y=y, model=model, features=features, raw=raw)
+        return trainer.get_feature_importance(X=X, y=y, model=model, features=features, raw=raw, subsample_size=subsample_size, silent=silent)
 
     # TODO: Add data info gathering at beginning of .fit() that is used by all learners to add to get_info output
     # TODO: Add feature inference / feature engineering info to get_info output
@@ -497,22 +531,26 @@ class AbstractLearner:
         if len(y) == 0:
             raise ValueError("provided labels cannot have length = 0")
         y = y.dropna()  # Remove missing values from y (there should not be any though as they were removed in Learner.general_data_processing())
-        unique_vals = y.unique()
         num_rows = len(y)
-        # print(unique_vals)
-        logger.log(20, f'Here are the first 10 unique label values in your data:  {unique_vals[:10]}')
-        unique_count = len(unique_vals)
+
+        unique_values = y.unique()
+        unique_count = len(unique_values)
+        logger.log(20, f'Here are the first 10 unique label values in your data:  {unique_values[:10]}')
+
         MULTICLASS_LIMIT = 1000  # if numeric and class count would be above this amount, assume it is regression
         if num_rows > 1000:
             REGRESS_THRESHOLD = 0.05  # if the unique-ratio is less than this, we assume multiclass classification, even when labels are integers
         else:
             REGRESS_THRESHOLD = 0.1
 
-        if len(unique_vals) == 2:
+        if unique_count == 2:
             problem_type = BINARY
             reason = "only two unique label-values observed"
-        elif np.issubdtype(unique_vals.dtype, np.floating):
-            unique_ratio = len(unique_vals) / float(len(y))
+        elif unique_values.dtype == 'object':
+            problem_type = MULTICLASS
+            reason = "dtype of label-column == object"
+        elif np.issubdtype(unique_values.dtype, np.floating):
+            unique_ratio = unique_count / float(num_rows)
             if (unique_ratio <= REGRESS_THRESHOLD) and (unique_count <= MULTICLASS_LIMIT):
                 try:
                     can_convert_to_int = np.array_equal(y, y.astype(int))
@@ -528,11 +566,8 @@ class AbstractLearner:
             else:
                 problem_type = REGRESSION
                 reason = "dtype of label-column == float and many unique label-values observed"
-        elif unique_vals.dtype == 'object':
-            problem_type = MULTICLASS
-            reason = "dtype of label-column == object"
-        elif np.issubdtype(unique_vals.dtype, np.integer):
-            unique_ratio = len(unique_vals) / float(len(y))
+        elif np.issubdtype(unique_values.dtype, np.integer):
+            unique_ratio = unique_count / float(num_rows)
             if (unique_ratio <= REGRESS_THRESHOLD) and (unique_count <= MULTICLASS_LIMIT):
                 problem_type = MULTICLASS  # TODO: Check if integers are from 0 to n-1 for n unique values, if they have a wide spread, it could still be regression
                 reason = "dtype of label-column == int, but few unique label-values observed"
@@ -540,9 +575,10 @@ class AbstractLearner:
                 problem_type = REGRESSION
                 reason = "dtype of label-column == int and many unique label-values observed"
         else:
-            raise NotImplementedError('label dtype', unique_vals.dtype, 'not supported!')
-        logger.log(25, "AutoGluon infers your prediction problem is: %s  (because %s)" % (problem_type, reason))
-        logger.log(25, "If this is wrong, please specify `problem_type` argument in fit() instead (You may specify problem_type as one of: ['%s', '%s', '%s'])\n" % (BINARY, MULTICLASS, REGRESSION))
+            raise NotImplementedError('label dtype', unique_values.dtype, 'not supported!')
+        logger.log(25, f"AutoGluon infers your prediction problem is: {problem_type}  (because {reason}).")
+        logger.log(25, f"If this is wrong, please specify `problem_type` argument in fit() instead "
+                       f"(You may specify problem_type as one of: [{BINARY, MULTICLASS, REGRESSION}])\n")
         return problem_type
 
     def save(self):

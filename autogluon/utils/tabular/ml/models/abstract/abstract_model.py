@@ -1,10 +1,13 @@
 import copy
 import logging
+import math
 import os
+import pickle
+import sys
 import time
 
-import numpy as np
 import pandas as pd
+import psutil
 
 from .model_trial import model_trial
 from ...constants import BINARY, REGRESSION, REFIT_FULL_SUFFIX
@@ -14,8 +17,8 @@ from .... import metrics
 from ....utils.loaders import load_pkl
 from ....utils.savers import save_pkl, save_json
 from ......core import Space, Categorical, List, NestedSpace
-from ......task.base import BasePredictor
 from ......scheduler.fifo import FIFOScheduler
+from ......task.base import BasePredictor
 
 logger = logging.getLogger(__name__)
 
@@ -221,10 +224,9 @@ class AbstractModel:
             return obj
 
     # TODO: Consider disabling feature pruning when num_features is high (>1000 for example), or using a faster feature importance calculation method
-    def compute_feature_importance(self, X, y, features_to_use=None, preprocess=True, **kwargs):
-        sample_size = 10000
-        if len(X) > sample_size:
-            X = X.sample(sample_size, random_state=0)
+    def compute_feature_importance(self, X, y, features_to_use=None, preprocess=True, subsample_size=10000, silent=False, **kwargs):
+        if (subsample_size is not None) and (len(X) > subsample_size):
+            X = X.sample(subsample_size, random_state=0)
             y = y.loc[X.index]
         else:
             X = X.copy()
@@ -244,7 +246,7 @@ class AbstractModel:
         banned_features = [feature for feature, importance in feature_importance_quick_dict.items() if importance == 0 and feature in features]
         features = [feature for feature in features if feature not in banned_features]
 
-        permutation_importance_dict = self.compute_permutation_importance(X=X, y=y, features=features, preprocess=False)
+        permutation_importance_dict = self.compute_permutation_importance(X=X, y=y, features=features, preprocess=False, silent=silent)
 
         feature_importances = pd.Series(permutation_importance_dict)
         results_banned = pd.Series(data=[0 for _ in range(len(banned_features))], index=banned_features)
@@ -255,34 +257,60 @@ class AbstractModel:
 
     # TODO: Consider repeating with different random seeds and averaging to increase confidence
     # TODO: Optimize this
-    # TODO: Check memory usage to avoid OOM
     # Compute feature importance via permutation importance
     # Note: Expensive to compute
     #  Time to compute is O(predict_time*num_features)
-    def compute_permutation_importance(self, X, y, features: list, preprocess=True) -> dict:
+    def compute_permutation_importance(self, X, y, features: list, preprocess=True, silent=False) -> dict:
+        time_start = time.time()
+
+        feature_count = len(features)
+        if not silent:
+            logger.log(20, f'Computing permutation importance for {feature_count} features on {self.name} ...')
         if preprocess:
             X = self.preprocess(X)
 
-        feature_count = len(features)
+        time_start_score = time.time()
         model_score_base = self.score(X=X, y=y, preprocess=False)
-        model_score_diff = []
+        time_score = time.time() - time_start_score
 
-        row_count = X.shape[0]
+        if not silent:
+            time_estimated = (feature_count + 1) * time_score + time_start_score - time_start
+            logger.log(20, f'\t{round(time_estimated, 2)}s\t= Expected runtime')
+
         X_test_shuffled = shuffle_df_rows(X=X, seed=0)
+        row_count = X.shape[0]
 
-        compute_count = 200
-        indices = [x for x in range(0, feature_count, compute_count)]
+        # calculating maximum number of features, which is safe to process parallel
+        X_memory_ratio_max = 0.2
+        compute_count_max = 200
 
-        # TODO: Make this faster by multi-threading?
-        for i, indice in enumerate(indices):
-            if indice + compute_count > feature_count:
-                compute_count = feature_count - indice
+        X_size_bytes = sys.getsizeof(pickle.dumps(X, protocol=4))
+        available_mem = psutil.virtual_memory().available
+        X_memory_ratio = X_size_bytes / available_mem
 
-            x = [X.copy() for _ in range(compute_count)]  # TODO Make this much faster, only make this and concat it once. Then just update values and reset the values edited each iteration
-            for j, val in enumerate(x):
-                feature = features[indice + j]
-                val[feature] = X_test_shuffled[feature].values
-            X_test_raw = pd.concat(x, ignore_index=True)
+        compute_count_safe = math.floor(X_memory_ratio_max / X_memory_ratio)
+        compute_count = max(1, min(compute_count_max, compute_count_safe))
+        compute_count = min(compute_count, feature_count)
+
+        # creating copy of original data N=compute_count times for parallel processing
+        X_test_raw = pd.concat([X.copy() for _ in range(compute_count)], ignore_index=True, sort=False).reset_index(drop=True)
+
+        #  TODO: Make this faster by multi-threading?
+        permutation_importance_dict = {}
+        for i in range(0, feature_count, compute_count):
+            parallel_computed_features = features[i:i + compute_count]
+
+            # if final iteration, leaving only necessary part of X_test_raw
+            num_features_processing = len(parallel_computed_features)
+            final_iteration = i + num_features_processing == feature_count
+            if (num_features_processing < compute_count) and final_iteration:
+                X_test_raw = X_test_raw.loc[:row_count * num_features_processing - 1]
+
+            row_index = 0
+            for feature in parallel_computed_features:
+                row_index_end = row_index + row_count
+                X_test_raw.loc[row_index:row_index_end - 1, feature] = X_test_shuffled[feature].values
+                row_index = row_index_end
 
             if self.metric_needs_y_pred:
                 Y_pred = self.predict(X_test_raw, preprocess=False)
@@ -290,14 +318,22 @@ class AbstractModel:
                 Y_pred = self.predict_proba(X_test_raw, preprocess=False)
 
             row_index = 0
-            for j in range(compute_count):
+            for feature in parallel_computed_features:
+                # calculating importance score for given feature
                 row_index_end = row_index + row_count
                 Y_pred_cur = Y_pred[row_index:row_index_end]
-                row_index = row_index_end
                 score = self.objective_func(y, Y_pred_cur)
-                model_score_diff.append(model_score_base - score)
+                permutation_importance_dict[feature] = model_score_base - score
 
-        permutation_importance_dict = {feature: score_diff for feature, score_diff in zip(features, model_score_diff)}
+                if not final_iteration:
+                    # resetting to original values for processed feature
+                    X_test_raw.loc[row_index:row_index_end - 1, feature] = X[feature].values
+
+                row_index = row_index_end
+
+        if not silent:
+            logger.log(20, f'\t{round(time.time() - time_start, 2)}s\t= Actual runtime')
+
         return permutation_importance_dict
 
     # Custom feature importance values for a model (such as those calculated from training)
