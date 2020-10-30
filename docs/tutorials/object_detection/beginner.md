@@ -5,13 +5,13 @@ Object detection is the process of identifying and localizing objects in an imag
 
 **Tip**: If you are new to AutoGluon, review :ref:`sec_imgquick` first to learn the basics of the AutoGluon API.
 
-Our goal is to detect motorbike in images by [YOLO3 model](https://pjreddie.com/media/files/papers/YOLOv3.pdf). A tiny dataset is collected from VOC dataset, which only contains the motorbike category. The model pretrained on the COCO dataset is used to fine-tune our small dataset. With the help of AutoGluon, we are able to try many models with different hyperparameters automatically, and return the best one as our final model. 
+Our goal is to detect motorbike in images by [YOLOv3 model](https://pjreddie.com/media/files/papers/YOLOv3.pdf). A tiny dataset is collected from VOC dataset, which only contains the motorbike category. The model pretrained on the COCO dataset is used to fine-tune our small dataset. With the help of AutoGluon, we are able to try many models with different hyperparameters automatically, and return the best one as our final model. 
 
-To start, import autogluon and ObjectDetection module as your task: 
+To start, import autogluon.vision and ObjectDetection module as your task: 
 
 ```{.python .input}
-import autogluon as ag
-from autogluon import ObjectDetection as task
+import autogluon.core as ag
+from autogluon.vision import ObjectDetection as task
 ```
 
 ## Tiny_motorbike Dataset
@@ -35,9 +35,9 @@ dataset_train = task.Dataset(data_root, classes=('motorbike',))
 ```
 
 ## Fit Models by AutoGluon
-In this section, we demonstrate how to apply AutoGluon to fit our detection models. We use mobilenet as the backbone for the YOLO3 model. Two different learning rates are used to fine-tune the network. The best model is the one that obtains the best performance on the validation dataset. You can also try using more networks and hyperparameters to create a larger searching space. 
+In this section, we demonstrate how to apply AutoGluon to fit our detection models. We use mobilenet as the backbone for the YOLOv3 model. Two different learning rates are used to fine-tune the network. The best model is the one that obtains the best performance on the validation dataset. You can also try using more networks and hyperparameters to create a larger searching space. 
 
-We `fit` a classifier using AutoGluon as follows. In each experiment (one trial in our searching space), we train the model for 30 epoches. 
+We `fit` a classifier using AutoGluon as follows. In each experiment (one trial in our searching space), we train the model for 30 epochs. 
 
 ```{.python .input}
 time_limits = 5*60*60  # 5 hours
@@ -49,6 +49,12 @@ detector = task.fit(dataset_train,
                     ngpus_per_trial=1,
                     time_limits=time_limits)
 ```
+
+Note that `num_trials=2` above is only used to speed up the tutorial. In normal
+practice, it is common to only use `time_limits` and drop `num_trials`. Also note
+that hyperparameter tuning defaults to random search. Model-based variants, such
+as `search_strategy='bayesopt'` or `search_strategy='bayesopt_hyperband'` can be
+a lot more sample-efficient.
 
 After fitting, AutoGluon automatically returns the best model among all models in the searching space. From the output, we know the best model is the one trained with the second learning rate. To see how well the returned model performed on test dataset, call detector.evaluate().
 
@@ -67,3 +73,13 @@ image_path = os.path.join(data_root, 'JPEGImages', image)
 
 ind, prob, loc = detector.predict(image_path)
 ```
+
+We can also save the trained model, and use it later. 
+```{.python .input}
+savefile = 'model.pkl'
+detector.save(savefile)
+
+from autogluon.vision import Detector
+new_detector = Detector.load(savefile)
+```
+

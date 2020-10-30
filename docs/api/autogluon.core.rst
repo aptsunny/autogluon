@@ -10,7 +10,7 @@ Decorators for customizing AutoGluon to apply hyperparameter-tuning on arbitrary
 
    Create class and function with searchable spaces for hyperparameters `name` and `idx`:
 
-   >>> import autogluon as ag
+   >>> import autogluon.core as ag
    >>> @ag.obj(
    ...     name=ag.space.Categorical('auto', 'gluon'),
    ...     idx = ag.space.Int(0, 100),
@@ -34,7 +34,7 @@ Decorators for customizing AutoGluon to apply hyperparameter-tuning on arbitrary
    ...     h, i = args.h, args.i
    ...     assert hasattr(h, 'name') or h == 'test'
    ...     assert i in ['mxnet', 'pytorch']
-   ...     reporter(epoch=e, accuracy=0)
+   ...     reporter(epoch=1, accuracy=0)
 
    Create a scheduler and run training trials to search for the best values of the hyperparameters:
 
@@ -49,8 +49,8 @@ Decorators for customizing AutoGluon to apply hyperparameter-tuning on arbitrary
 Core APIs
 ---------
 
-.. automodule:: autogluon
-.. currentmodule:: autogluon
+.. automodule:: autogluon.core
+.. currentmodule:: autogluon.core
 
 .. autosummary::
    :nosignatures:

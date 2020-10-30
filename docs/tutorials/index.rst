@@ -10,19 +10,20 @@ Image Classification
       :title: Quick Start Using FIT
       :link: image_classification/beginner.html
 
-      Quick start tutorial.
+      5 min tutorial on classifying images.
 
    .. card::
       :title: Customized Search and HPO
       :link: image_classification/hpo.html
 
-      Image classification HPO tutorial.
+      Hyperparameter tuning to improve image classification accuracy.
 
    .. card::
       :title: Use Your Own Dataset
       :link: image_classification/kaggle.html
 
-      Participate Kaggle competition.
+      Example use of AutoGluon for image classification competition on Kaggle.
+
 
 Object Detection
 ----------------
@@ -32,7 +33,7 @@ Object Detection
       :title: Quick Start Using FIT
       :link: object_detection/beginner.html
 
-      Quick start tutorial.
+      5 min tutorial on detecting objects in images.
 
 
 Tabular Prediction
@@ -43,38 +44,77 @@ Tabular Prediction
       :title: Quick Start Tutorial
       :link: tabular_prediction/tabular-quickstart.html
 
-      Quick tutorial on fitting models with tabular datasets.
+      5 min tutorial on fitting models with tabular datasets.
 
    .. card::
       :title: In-depth FIT Tutorial
       :link: tabular_prediction/tabular-indepth.html
 
-      In-depth tutorial on controlling various aspects of model fitting.
+      In-depth tutorial on boosting accuracy and controlling model fitting.
 
-Customize AutoGluon
--------------------
+   .. card::
+      :title: Kaggle Tutorial
+      :link: tabular_prediction/tabular-kaggle.html
+
+      Using AutoGluon for Kaggle competitions with tabular data.
+
+
+Text Prediction
+---------------
+.. container:: cards
+
+   .. card::
+      :title: Quick Start Tutorial
+      :link: text_prediction/beginner.html
+
+      10 min tutorial on fitting prediction models with text in the dataset.
+
+   .. card::
+      :title: Customize Search Space and HPO
+      :link: text_prediction/customization.html
+
+      In-depth tutorial on learning how to customize the search space and try different
+      HPO algorithms.
+
+   .. card::
+      :title: Dealing with Mixed Data Types
+      :link: text_prediction/heterogeneous.html
+
+      Learning how to use AutoGluon to handle datasets with mixed data types.
+
+
+Tuning Custom Models
+--------------------
 .. container:: cards
    
    .. card::
       :title: Search Space and Decorator
       :link: course/core.html
 
-      Learn AutoGluon Core API for customized search spaces,
-      customize searchable objects, and training functions.
+      AutoGluon's Core API for search spaces and searchable 
+      objects used to tune any training function's argument-values.
 
    .. card::
       :title: Search Algorithms
       :link: course/algorithm.html
 
-      Learning AutoGluon built-in search algorithms and
-      early-stopping scheduling strategy.
+      Use AutoGluon's search algorithms to tune 
+      arbitrary models/training-scripts.
 
    .. card::
       :title: Distributed Search Tutorial
-      :link: cource/distributed.md
+      :link: course/distributed.html
 
-      Easily scale up training across multiple machines using
-      automatic distributed search.
+      Easily distribute AutoGluon tuning 
+      across multiple machines.
+   
+   .. card::
+      :title: Tune a Multi-Layer Perceptron
+      :link: course/mlp.html
+
+      Complete example of how to use AutoGluon
+      and its state-of-the-art schedulers and 
+      model-based searchers to tune a MLP.
 
 
 Neural Architecture Search
@@ -82,17 +122,17 @@ Neural Architecture Search
 .. container:: cards
 
    .. card::
-      :title: Reinforcement Learing
+      :title: Reinforcement Learning
       :link: nas/rl_searcher.html
 
-      Compare Reinforcement Learning with Random Searcher.
+      Comparing search via Reinforcement Learning against Random search.
 
    .. card::
       :title: Efficient NAS on Target Hardware
-      :link: nas/enas_mnist.html
+      :link: nas/enas_proxylessnas.html
 
       Efficient Neural Architecture Search for low latency model
-      on Target Hardware.
+      on target hardware.
 
 
 .. toctree::
@@ -103,6 +143,7 @@ Neural Architecture Search
    image_classification/index
    object_detection/index
    text_classification/index
+   text_prediction/index
    tabular_prediction/index
    customize/index
    nas/index
